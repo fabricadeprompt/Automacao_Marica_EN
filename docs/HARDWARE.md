@@ -67,12 +67,21 @@ board's GND, and extends over the cable to the ESP32's GND pin (Pump box).
 
 ## Enclosures
 
-The three electronic boxes (Water, Pump, Control) use the same standard: surface-mount
-4x4 enclosure, IP66 electrical rating, 110x110x60mm.
+The three electronic boxes (Water, Pump, Control) use the same standard: **4x4
+surface-mount CFTV-style junction box with electrical insulation**, white — a generic
+passage/junction box (electrical/telephone/data/CFTV), with a rubber sealing ring and
+a mounting channel external to the seal. IP66 electrical rating, 110x110x60mm.
+
+The Electrical box uses a different, non-generic enclosure: **WEG QDW02-18-FS** (part
+no. 11377386), a surface-mount distribution panel with a smoke-tinted acrylic front
+cover and plastic housing. Fits up to 18 single-pole DIN breakers (or 9 two-pole, or 6
+three-pole). Rated 125A continuous, 500V insulation, 60Hz. Dimensions: 22 x 36.2 x
+9.9cm.
 
 ## Remote console
 
-Outside the scope of this repository's firmware (own firmware, not included here).
+Firmware included in this repository (`main_cardputer.cpp`), alongside the other
+three boxes.
 
 | Component | Model |
 |---|---|
@@ -80,8 +89,12 @@ Outside the scope of this repository's firmware (own firmware, not included here
 
 ## Planned (not installed)
 
-Components already purchased for condensation mitigation on the Water box's
-ultrasonic sensor, but with no physical implementation yet:
+Nothing below is physically installed, and none of it is on an active near-term
+schedule. Since a firmware fix (`modo_reflexao`, see `docs/PROTOCOL.md`) started
+compensating condensation-driven readings in software, the system has been working
+reliably as configured, with no further reading issues. These components — already
+purchased — are now contingencies, revisited only if a problem resurfaces, not a
+committed roadmap:
 
 - 2x XKC-Y25-V capacitive sensor (max/min level redundancy)
 - DHT22/AM2302 temperature/humidity sensor + SHT31 probe (IP67)
