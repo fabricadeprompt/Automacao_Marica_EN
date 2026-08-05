@@ -39,6 +39,28 @@ they all start from the same `marica_protocol.h`. The coordinated-order rule (se
 before receiver) only applies **later**, when updating a shared struct that's already
 running in the field — see `docs/PROTOCOL.md`.
 
+## OTA updates (PlatformIO)
+
+The initial flash (above) is done over USB via the Arduino IDE. Once a box is already
+running, it can also be updated over Wi-Fi using the `ArduinoOTA` library already
+built into the firmware, with **PlatformIO** as the tool that pushes the new binary
+(`upload_protocol = espota`) — triggered by placing the box into OTA mode first (via
+the Cardputer's remote trigger, or the Control box's local web server).
+
+This repository doesn't include a `platformio.ini` — OTA-over-Wi-Fi is optional and
+sits outside the Arduino IDE flow described above. To set it up yourself, the minimum
+PlatformIO config per box just points `upload_port` at the same fixed IP you already
+set in step 4: no new address to define, it reuses `IP_AGUA` / `IP_BOMBA` /
+`IP_CONTROLE` from `marica_protocol.h`.
+
+```ini
+[env:agua_ota]
+upload_protocol = espota
+upload_port = 192.168.1.92  ; same IP_AGUA you set in marica_protocol.h
+```
+
+Repeat one `[env:..._ota]` block per box, one `upload_port` each.
+
 ## ESP-NOW channel
 
 `CANAL_SEGURANCA_PADRAO` (channel 2) is explicitly fixed before `esp_now_init()`, in a
