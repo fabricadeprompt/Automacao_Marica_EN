@@ -56,8 +56,8 @@ instead of assuming the last known value is still current).
 This project is under active development — not every box is at the same level of maturity:
 
 - **Pump and Control boxes:** relay redundancy, safety self-test, and unified error signaling are implemented, reviewed, and already running on the currently flashed firmware.
-- **Water box:** consistent condensation-driven echo doubling is now compensated in software, through an acoustic multipath compensation algorithm (`modo_reflexao`); instability beyond that threshold still falls back to an absolute timeout and a fail-safe flag, rather than reporting an unreliable reading.
-- **Sensor redundancy still pending:** the overflow pipe (*ladrão*) currently relies on a single XKC-Y26S-V sensor as the last physical fail-safe, with no backup unit installed yet. Two XKC-Y25-V capacitive sensors, meant as absolute low/high level failsafes, have also been sourced but not yet installed. Both are planned upgrades, not yet executed.
+- **Water box:** consistent condensation-driven echo doubling is compensated in software, through an acoustic multipath compensation algorithm (`modo_reflexao`); instability beyond that threshold still falls back to an absolute timeout and a fail-safe flag, rather than reporting an unreliable reading. Readings have been reliable since this fix, with no further issues.
+- **Physical sensor redundancy — a contingency, not a schedule:** this project ships with the Water box as described above: a single XKC-Y26S-V sensor on the overflow pipe (*ladrão*), no backup unit, and no XKC-Y25-V absolute low/high level sensors installed. These, along with the DHT22/SHT31 + resistive heating package (see [`docs/HARDWARE.md`](docs/HARDWARE.md)), are already sourced but intentionally not scheduled — they'd only be installed if condensation-related issues resurface.
 
 If something here looks unfinished, it's because it is — the intent is to document the real engineering process, not a finished product.
 
@@ -104,8 +104,7 @@ docs/
 > Portuguese in this repository. This English repo is a translated snapshot of the
 > documentation only; the firmware itself was not translated (renaming thousands of
 > identifiers would mean retesting the whole safety logic from scratch, not a text
-> translation). See the Portuguese repository for the actively maintained firmware:
-> [https://github.com/fabricadeprompt/Automacao-Marica](https://github.com/fabricadeprompt/Automacao-Marica)
+> translation).
 
 ## License
 
