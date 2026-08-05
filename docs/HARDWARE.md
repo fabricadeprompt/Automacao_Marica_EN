@@ -96,6 +96,8 @@ reliably as configured, with no further reading issues. These components — alr
 purchased — are now contingencies, revisited only if a problem resurfaces, not a
 committed roadmap:
 
+- 2nd XKC-Y26S-V capacitive sensor on the overflow pipe (*ladrão*) — cross-validation
+  against false positives from residual moisture
 - 2x XKC-Y25-V capacitive sensor (max/min level redundancy)
 - DHT22/AM2302 temperature/humidity sensor + SHT31 probe (IP67)
 - Resistive heating for the transducer: IRLZ44N MOSFET + resistors + dedicated
