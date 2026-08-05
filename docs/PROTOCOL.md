@@ -37,6 +37,7 @@ the Water box with its own data before pushing it up to Supabase.
 | `bomba_erro_bitmask` | Errors that actively block/shut down the pump (timeout, overflow, PZEM failure) |
 | `pzem_potencia_w`, `pzem_tensao_v`, `pzem_corrente_a`, `pzem_fp`, `pzem_energia_kwh` | Instantaneous and cumulative readings from the PZEM-004T |
 | `agua_offline` | Water→Pump radio silence for more than 60s — distinct from an actual sensor error |
+| `agua_motivo_status` | Reason behind the Water box's current sensor status: normal reading, actively compensating for condensation (`modo_reflexao`, within its 20-minute window), no physical echo, condensation timeout exceeded, or unstable readings while the pump is running. Purely informational for the dashboard — never read by any safety decision |
 | `bomba_estado_bitmask` | **Informational** states only (quarantine, lockout, forced mode, stuck relay) — never used for safety decisions |
 | `bomba_causa_desligamento` | Reason for the last shutdown (manual, tank full, timeout, overflow, etc.) |
 
