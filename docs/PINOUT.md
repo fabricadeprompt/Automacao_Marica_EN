@@ -40,11 +40,19 @@
 | 14 | Button 1 — short press turns the pump on, 3s hold opens the local web server |
 | 12 | Button 2 — emergency stop |
 
+## Cardputer (`main_cardputer.cpp`)
+
+No GPIO pin map — the M5Cardputer library routes all peripherals (TFT display,
+keyboard, RF) internally on the M5Stack board. No external GPIO wiring involved.
+
 ## Pending (Water Box — architecture decided, not yet implemented in firmware)
 
 - 2nd **XKC-Y25-V** unit (minimum level), added to the 1st already on hand (maximum
   level) — level redundancy against a single-point sensor. No GPIO defined in code
-  yet: physical installation depends on a field visit.
+  yet.
 - 2nd **XKC-Y26S-V** unit on the overflow pipe — cross-validation against false
-  positives from residual moisture. Same situation: purchased, installation/GPIO
-  pending.
+  positives from residual moisture. Same situation, no GPIO defined.
+
+Neither is on an active schedule: readings have been reliable since the
+`modo_reflexao` software fix (see `docs/PROTOCOL.md`), so both are contingencies —
+installed only if condensation-related issues resurface, not a committed roadmap.
