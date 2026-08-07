@@ -42,6 +42,20 @@ static const IPAddress IP_BOMBA   (192, 168, 1, 91);
 static const IPAddress IP_AGUA    (192, 168, 1, 92);
 
 // -------------------------------------------------------------
+// PARÂMETROS DE EXIBIÇÃO — SINALEIRA (Caixa Controle) — 2026-08-07 (marica-226/227)
+// -------------------------------------------------------------
+// Limites de cor verde/amarelo da sinaleira, deliberadamente independentes de
+// nivel_liga_cm/nivel_desliga_cm (decisão explícita de Peter, marica-226 -- reverte
+// parcialmente o princípio do marica-215). Definidos aqui, não em main_controle.cpp,
+// porque main_bomba.cpp também precisa validar contra SINALEIRA_AMARELO_MAX_CM em
+// CMD_SET_NIVEIS (marica-227): sem isso, reconfigurar nivel_seguranca_cm pra um valor
+// <= SINALEIRA_AMARELO_MAX_CM torna o vermelho ESTÁTICO da sinaleira matematicamente
+// inalcançável (o vermelho PISCANTE, de nivel_seguranca_cm, sempre dispara primeiro).
+// Fonte única -- nunca duplicar o valor localmente em outro arquivo.
+#define SINALEIRA_VERDE_MAX_CM     45.0f  // distância <= isso -> verde (caixa "cheia")
+#define SINALEIRA_AMARELO_MAX_CM   55.0f  // distância <= isso -> amarelo; acima -> vermelho estático
+
+// -------------------------------------------------------------
 // IDENTIFICADORES DE PACOTE
 // -------------------------------------------------------------
 enum TipoPacote : uint8_t {
@@ -185,6 +199,19 @@ struct __attribute__((packed)) PacketStatusCompleto {
                                   // no final, mesmo motivo. Emissor desta rodada é a
                                   // própria Bomba (não a Água) -- ordem de flash só
                                   // Bomba -> Controle para este campo específico.
+    bool     autoteste_concluido; // 2026-08-06 -- true SÓ no pacote enviado
+                                  // imediatamente após executar_autoteste_rele()
+                                  // terminar (qualquer resultado, mudando ou não o
+                                  // estado). Controle usa isso para carimbar
+                                  // ultimo_autoteste_epoch com seu próprio relógio
+                                  // NTP -- a Bomba não tem hora real, só a Controle.
+                                  // Campo NOVO (aumenta o tamanho da struct) --
+                                  // emissor é a Bomba, EXIGE ordem de flash
+                                  // Bomba -> Controle (marica-134/165): se a
+                                  // Controle for flashada primeiro, ela passa a
+                                  // exigir sizeof(struct) maior no `len >=` de
+                                  // cb_recepcao() e rejeita 100% dos pacotes da
+                                  // Bomba antiga até esta também ser atualizada.
 };
 
 // Downstream: Controle → Bomba (3 bytes)
