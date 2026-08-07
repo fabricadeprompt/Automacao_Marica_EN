@@ -83,7 +83,15 @@ static const uint8_t MAC_PROPRIA[] = {0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0x02}; // TO
                                             // ~0W a vazio), bem abaixo do limiar de 100W usado
                                             // pela Controle para detecção de sessão manual —
                                             // valor inicial, ajustar com leitura real de campo
-#define AUTOTESTE_ESTABILIZA_MS    300UL   // espera antes de consultar o PZEM após comutar o relé
+// 2026-08-07 -- 300ms -> 1500ms (achado de revisão Gemini, marica-221/222, validado
+// de forma independente contra relatos de terceiros sobre a lib do PZEM-004T): o chip
+// tem taxa de atualização interna de ~1Hz -- ler antes disso corre dois riscos, não só
+// um. Com 300ms: (a) a pré-checagem podia ainda refletir a carga anterior ao desligamento
+// (falso positivo, caso observado em campo); (b) mais grave, as Fases 1/2 podiam ler ~0W
+// mesmo com o outro relé genuinamente colado puxando corrente de verdade, porque o PZEM
+// não teve tempo de integrar a nova carga -- falso negativo, o auto-teste reportando "OK"
+// pra um relé realmente soldado. 1500ms garante margem sobre o ciclo de 1s do chip.
+#define AUTOTESTE_ESTABILIZA_MS    1500UL  // espera antes de consultar o PZEM após comutar o relé
 
 // Valores padrão dos níveis — usados apenas se NVS estiver vazio
 #define NIVEL_LIGA_CM_PADRAO        80
@@ -158,6 +166,17 @@ static volatile bool autoteste_pendente     = false;  // setado em desligar_bomb
 static bool           rele_colado_detectado = false;  // resultado do último auto-teste,
                                                         // vai em bomba_estado_bitmask
 
+// 2026-08-07 (marica-234) -- timestamp do último desligamento, pra loop_pzem() detectar se
+// um desligar_bomba() aconteceu DURANTE a espera bloqueante de pzem_ler() (até ~500ms na UART)
+// e descartar a leitura obsoleta em vez de sobrescrever o 0.0f que desligar_bomba() já tinha
+// gravado. Sem isso, o fix do marica-232 sozinho tem uma corrida residual: cb_recepcao() roda
+// em task separada da ESP-NOW (mesmo mecanismo do marica-156) e pode chamar desligar_bomba()
+// enquanto loop_pzem() está no meio da leitura -- a leitura em voo já reflete a carga de ANTES
+// do corte (~480W), e ao retornar sobrescreve o zero recém-gravado, recriando o falso positivo
+// de "sessão manual" no próximo enviar_status(). volatile: escrita possível em task diferente
+// da leitura (mesmo padrão de autoteste_pendente acima).
+static volatile uint32_t ultimo_desligamento_ms = 0;
+
 Preferences prefs;
 
 // -------------------------------------------------------------
@@ -166,7 +185,9 @@ Preferences prefs;
 void iniciar_espnow();
 void ligar_bomba(bool ignorar_nivel = false);
 void desligar_bomba(bool por_erro, uint8_t motivo = CAUSA_DESLIGA_MANUAL);
-void enviar_status();
+void enviar_status(bool autoteste_concluido = false);  // 2026-08-06 -- default preserva
+                                                          // os outros 14 pontos de chamada
+                                                          // sem precisar tocar em nenhum
 void iniciar_ota();
 void encerrar_ota();
 void loop_ota();
@@ -427,11 +448,16 @@ void cb_recepcao(const uint8_t* mac_addr, const uint8_t* dados, int len) {
         PacketConfigNiveis pkt_cfg;
         memcpy(&pkt_cfg, dados, sizeof(pkt_cfg));
 
-        // Valida: liga > desliga, segurança > liga, manual_min < liga, timeout > 0
+        // Valida: liga > desliga, segurança > liga, manual_min < liga, timeout > 0,
+        // segurança > SINALEIRA_AMARELO_MAX_CM (2026-08-07, marica-227 -- sem isso,
+        // reconfigurar nivel_seguranca_cm pra <= SINALEIRA_AMARELO_MAX_CM torna o
+        // vermelho estático da sinaleira inalcançável; Bomba valida como autoridade
+        // final, não confia só na checagem da Controle em rota_set_niveis())
         if (pkt_cfg.nivel_liga_cm > pkt_cfg.nivel_desliga_cm &&
             pkt_cfg.nivel_seguranca_cm > pkt_cfg.nivel_liga_cm &&
             pkt_cfg.nivel_manual_min_cm < pkt_cfg.nivel_liga_cm &&
-            pkt_cfg.timeout_minutos > 0) {
+            pkt_cfg.timeout_minutos > 0 &&
+            (float)pkt_cfg.nivel_seguranca_cm > SINALEIRA_AMARELO_MAX_CM) {
 
             nivel_liga_cm            = pkt_cfg.nivel_liga_cm;
             nivel_desliga_cm         = pkt_cfg.nivel_desliga_cm;
@@ -534,6 +560,19 @@ void desligar_bomba(bool por_erro, uint8_t motivo) {
     ultima_causa_desligamento = motivo;  // 2026-07-25
     digitalWrite(GPIO_K1, RELE_DESLIGA);
     digitalWrite(GPIO_K2, RELE_DESLIGA);
+    // 2026-08-07 (marica-232) -- zera a leitura de potência/corrente ANTES de enviar_status().
+    // Sem isso, o pacote deste exato instante carregava pzem_potencia_w desatualizado (só
+    // refrescado por loop_pzem() a cada 5s) junto com bomba_ligada=false -- padrão que o
+    // gatilho detectar_sessao_manual_marica() (Supabase) interpreta como "chave física Lukma
+    // acionada" (bomba_ligada=false + pzem_w>100W). Fisicamente correto zerar aqui: sem
+    // corrente fluindo pelos relés abertos, a leitura real é ~0 -- loop_pzem() reconfirma
+    // isso no próximo ciclo de qualquer forma. Não afeta a detecção de relé colado, que usa
+    // leituras próprias e dedicadas (executar_autoteste_rele()), nunca este campo global.
+    pzem_potencia_w  = 0.0f;
+    pzem_corrente_a  = 0.0f;
+    ultimo_desligamento_ms = millis();  // 2026-08-07 (marica-234) -- loop_pzem() usa isso
+                                         // pra descartar leitura em voo obsoleta (ver comentário
+                                         // na declaração da variável)
     Serial.println(F("[BOMBA] Bomba DESLIGADA (K1+K2)."));
     autoteste_pendente = true;  // 2026-07-27 — dispara auto-teste no próximo loop() (marica-149/150)
     enviar_status();
@@ -542,7 +581,7 @@ void desligar_bomba(bool por_erro, uint8_t motivo) {
 // -------------------------------------------------------------
 // PACOTE STATUS COMPLETO — Bomba → Controle
 // -------------------------------------------------------------
-void enviar_status() {
+void enviar_status(bool autoteste_concluido) {
     PacketStatusCompleto pkt = {};
     pkt.tipo               = PKT_STATUS_COMPLETO;
     pkt.agua_distancia_cm  = nivel_atual_cm;
@@ -563,6 +602,8 @@ void enviar_status() {
         | (modo_forcado          ? ESTADO_MODO_FORCADO : 0)
         | (rele_colado_detectado ? ESTADO_RELE_COLADO  : 0);  // 2026-07-27 -- marica-149/152
     pkt.bomba_causa_desligamento = ultima_causa_desligamento;  // 2026-07-25
+    pkt.autoteste_concluido = autoteste_concluido;  // 2026-08-06 -- true só quando esta
+                                                     // chamada vem de executar_autoteste_rele()
     esp_now_send(MAC_CONTROLE, (uint8_t*)&pkt, sizeof(pkt));
 }
 
@@ -641,8 +682,22 @@ void loop_pzem() {
     if (millis() - ultimo_pzem < PZEM_INTERVALO_MS) return;
     ultimo_pzem = millis();
 
+    // 2026-08-07 (marica-234) -- snapshot ANTES da leitura bloqueante (até ~500ms na UART).
+    // Comparado depois contra ultimo_desligamento_ms pra detectar se um desligar_bomba()
+    // aconteceu enquanto pzem_ler() estava em voo -- nesse caso a leitura reflete a carga
+    // de ANTES do corte e deve ser descartada, não sobrescrever o 0.0f já gravado.
+    uint32_t t_inicio_leitura = millis();
+
     float v, i, p, kwh, hz, fp;
     if (pzem_ler(v, i, p, kwh, hz, fp)) {
+        // Comparação segura contra overflow de millis() (mesmo idioma de silencio/timeout
+        // já usado no arquivo): >= 0 significa que o desligamento aconteceu depois que a
+        // leitura começou -- descarta, pois desligar_bomba() já é a fonte de verdade mais
+        // recente pro estado de potência/corrente.
+        if ((int32_t)(ultimo_desligamento_ms - t_inicio_leitura) >= 0) {
+            Serial.println(F("[PZEM] Leitura descartada -- desligamento ocorreu durante a espera da UART."));
+            return;
+        }
         pzem_tensao_v    = v;
         pzem_corrente_a  = i;
         pzem_potencia_w  = p;
@@ -699,39 +754,102 @@ void loop_pzem() {
 // solda durante esta própria tentativa de abertura, com K1 abrindo normalmente
 // — esse só aparece quando a Fase 1 fecha o K1 de novo, e não tem mitigação
 // possível: é a física do relé em série, não um bug de lógica.
+// -------------------------------------------------------------
+// GUARD DE CONCORRÊNCIA — ligar_bomba() durante o auto-teste (2026-08-07, marica-224)
+// -------------------------------------------------------------
+// Revisão Gemini, 3ª rodada sobre o auto-teste: o guard "passivo" (só abortar sem
+// tocar em GPIO) introduzido na 2ª rodada (marica-223) tinha duas lacunas reais:
+// (1) nenhuma checagem existia ANTES das duas escritas incondicionais no topo da
+// função -- se ligar_bomba() rodou via cb_recepcao() no intervalo entre
+// desligar_bomba() setar autoteste_pendente=true e o loop() chamar esta função,
+// bomba_ligada já chegava true e as duas primeiras linhas desligavam fisicamente
+// uma bomba que tinha acabado de ligar; (2) mesmo com guard logo após cada
+// delay()/pzem_ler(), existe uma janela estreita (nível de instrução, não de
+// segundos) entre o guard aprovar (bomba_ligada==false) e o digitalWrite seguinte
+// executar -- um scheduler preemptivo pode intercalar cb_recepcao() bem nesse meio.
+// Fechar essa janela por completo exigiria seção crítica (portMUX, já usado no
+// Cardputer pra um problema análogo) em ligar_bomba()/desligar_bomba()/aqui --
+// fora do escopo desta correção pontual. Mitigação adotada: em vez de abortar
+// passivamente (que pode deixar o hardware num estado que não é nem o do teste
+// nem o do comando concorrente), o guard RESTAURA ativamente K1=LIGA/K2=LIGA
+// sempre que detecta bomba_ligada=true. Se a janela estreita acima ainda assim
+// for atingida, o PRÓXIMO guard (no máximo ~1,5s depois, o tempo de um
+// delay(AUTOTESTE_ESTABILIZA_MS)) já corrige de volta -- troca "pode ficar
+// dessincronizado até o próximo ciclo completo da bomba" por "autocorrige em
+// até ~1,5s". Consolidado num único helper (não 9 blocos repetidos) por
+// sugestão da revisão -- reduz risco de um ponto de chamada divergir dos outros
+// com o tempo. Função, não macro: evita armadilhas de higiene de macro em C++
+// (o "return" do chamador continua explícito em cada ponto de uso).
+static bool autoteste_guard_bomba_ligou() {
+    if (!bomba_ligada) return false;
+    digitalWrite(GPIO_K1, RELE_LIGA);
+    digitalWrite(GPIO_K2, RELE_LIGA);
+    autoteste_pendente = false;
+    Serial.println(F("[BOMBA] Auto-teste abortado -- bomba ligada durante o teste (comando concorrente). Rele restaurado."));
+    return true;
+}
+
 void executar_autoteste_rele() {
     Serial.println(F("[BOMBA] Auto-teste de rele: iniciando."));
 
+    // 2026-08-07 (marica-224, revisão Gemini 3ª rodada): guard adicional ANTES das
+    // duas escritas incondicionais abaixo -- lacuna real: se ligar_bomba() rodou via
+    // cb_recepcao() no intervalo entre desligar_bomba() setar autoteste_pendente=true
+    // e o loop() chegar a chamar esta função, bomba_ligada já está true quando a função
+    // COMEÇA a executar, e as duas linhas seguintes desligariam fisicamente uma bomba
+    // que acabou de ligar legitimamente, sem nenhuma checagem prévia.
+    if (autoteste_guard_bomba_ligou()) return;
+
     digitalWrite(GPIO_K1, RELE_DESLIGA);
     digitalWrite(GPIO_K2, RELE_DESLIGA);
-    delay(50);  // debounce antes de qualquer leitura
+    // 2026-08-07 -- debounce da pré-checagem alinhado a AUTOTESTE_ESTABILIZA_MS (ver
+    // definição da macro pro valor atual e o porquê), mesma constante usada nas Fases
+    // 1/2 abaixo. Antes usava 50ms fixo, sem relação documentada com o tempo real de
+    // assentamento do PZEM após comutar o relé -- achado de campo (marica-221):
+    // pré-checagem sinalizou "rele colado" logo após a bomba desligar de uma carga real
+    // (~480W por ~14min); telemetria seguinte (pzem_w=0 constante por dezenas de minutos,
+    // fora do auto-teste) contradiz relé fisicamente soldado -- consistente com o PZEM
+    // ainda não ter assentado a leitura em só 50ms. Revisão Gemini (marica-222) apontou
+    // risco maior no mesmo mecanismo: 300ms também era insuficiente e arriscava falso
+    // negativo nas Fases 1/2 (relé colado de verdade passando como "OK").
+    delay(AUTOTESTE_ESTABILIZA_MS);
+    if (autoteste_guard_bomba_ligou()) return;
 
     // Pré-checagem — se já houver carga com os dois relés comandados abertos, os
     // dois provavelmente já estão colados fechados (marica-140). Não fecha K1
     // pra isolar K2 nesse caso — sinaliza falha direto, sem religar nada.
-    float v0, i0, p0, kwh0, hz0, fp0;
+    float v0 = 0.0f, i0 = 0.0f, p0 = 0.0f, kwh0 = 0.0f, hz0 = 0.0f, fp0 = 0.0f;  // 2026-08-07,
+                                        // marica-225: inicializados -- pzem_ler() retornando false
+                                        // (CRC/timeout UART) não toca nessas variáveis, então sem
+                                        // inicialização o valor seria lixo de stack
     bool ok_pre = pzem_ler(v0, i0, p0, kwh0, hz0, fp0);
+    if (autoteste_guard_bomba_ligou()) return;
     if (ok_pre && p0 > AUTOTESTE_PZEM_MARGEM_W) {
         Serial.printf("[BOMBA] Auto-teste: carga ja presente antes do teste (%.1fW) -- ambos os reles suspeitos. Fases puladas.\n", p0);
-        if (!rele_colado_detectado) {
-            rele_colado_detectado = true;
-            enviar_status();
-        }
+        rele_colado_detectado = true;
         autoteste_pendente = false;
+        // 2026-08-06 -- sempre envia ao concluir (mesmo se já era colado antes), pra
+        // Controle poder carimbar quando o último auto-teste rodou de fato.
+        enviar_status(true);
         return;
     }
 
     digitalWrite(GPIO_K1, RELE_LIGA);           // Fase 1 — K1 sozinho
     delay(AUTOTESTE_ESTABILIZA_MS);
-    float v1, i1, p1, kwh1, hz1, fp1;
+    float v1 = 0.0f, i1 = 0.0f, p1 = 0.0f, kwh1 = 0.0f, hz1 = 0.0f, fp1 = 0.0f;  // 2026-08-07,
+                                        // marica-225 -- ver comentário na declaração de v0 acima
     bool  ok_k1 = pzem_ler(v1, i1, p1, kwh1, hz1, fp1);
+    if (autoteste_guard_bomba_ligou()) return;
     digitalWrite(GPIO_K1, RELE_DESLIGA);
     delay(100);
+    if (autoteste_guard_bomba_ligou()) return;
 
     digitalWrite(GPIO_K2, RELE_LIGA);           // Fase 2 — K2 sozinho
     delay(AUTOTESTE_ESTABILIZA_MS);
-    float v2, i2, p2, kwh2, hz2, fp2;
+    float v2 = 0.0f, i2 = 0.0f, p2 = 0.0f, kwh2 = 0.0f, hz2 = 0.0f, fp2 = 0.0f;  // 2026-08-07,
+                                        // marica-225 -- ver comentário na declaração de v0 acima
     bool  ok_k2 = pzem_ler(v2, i2, p2, kwh2, hz2, fp2);
+    if (autoteste_guard_bomba_ligou()) return;
     digitalWrite(GPIO_K2, RELE_DESLIGA);        // estado final: os dois abertos
 
     bool falha = (ok_k1 && p1 > AUTOTESTE_PZEM_MARGEM_W) ||
@@ -741,10 +859,13 @@ void executar_autoteste_rele() {
         rele_colado_detectado = falha;
         Serial.printf("[BOMBA] Auto-teste: %s (K1=%.1fW K2=%.1fW margem=%.1fW)\n",
                       falha ? "FALHOU - rele colado" : "OK", p1, p2, AUTOTESTE_PZEM_MARGEM_W);
-        enviar_status();
     } else {
         Serial.printf("[BOMBA] Auto-teste concluido: K1=%.1fW K2=%.1fW (sem mudanca de estado).\n", p1, p2);
     }
+    // 2026-08-06 -- sempre envia ao concluir agora (antes só enviava se o resultado
+    // mudasse) -- prova pro Controle/dashboard que o teste rodou agora, não só
+    // quando o estado de rele_colado_detectado muda.
+    enviar_status(true);
 
     autoteste_pendente = false;
 }
