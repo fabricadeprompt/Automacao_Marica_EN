@@ -95,6 +95,11 @@
 // cacheado como se fosse corrente (marica-090/092).
 #define SINALEIRA_TIMEOUT_MS      300000UL
 
+// SINALEIRA_VERDE_MAX_CM / SINALEIRA_AMARELO_MAX_CM: definidas em marica_protocol.h
+// (não aqui) -- 2026-08-07, marica-227: main_bomba.cpp também precisa validar contra
+// SINALEIRA_AMARELO_MAX_CM em CMD_SET_NIVEIS, então a constante vive no header
+// compartilhado como fonte única, não duplicada por arquivo.
+
 // -------------------------------------------------------------
 // NVS
 // -------------------------------------------------------------
@@ -182,6 +187,7 @@ struct PontoTelemetria {
     bool     ntp_sincronizado;      // 2026-07-25
     bool     wifi_falhou;           // 2026-07-25
     bool     comando_falhou;        // 2026-07-25
+    uint32_t ultimo_autoteste_epoch; // 2026-08-06
 };
 
 static PontoTelemetria buffer_telemetria[MAX_TELEMETRIA];
@@ -209,10 +215,29 @@ static uint8_t      erros_ativos         = 0;
 static uint8_t      agua_motivo_status   = 0;      // MotivoStatusAgua repassado -- 2026-07-25
 static uint8_t      bomba_estado_bitmask = 0;      // BitmaskEstadoBomba repassado -- 2026-07-25
 static uint8_t      bomba_causa_desligamento = 0;  // CausaDesligamentoBomba repassado -- 2026-07-25
+static uint32_t     ultimo_autoteste_epoch = 0;    // 2026-08-06 -- carimbado com o relógio NTP
+                                                     // da própria Controle (a Bomba não tem hora
+                                                     // real) quando pkt.autoteste_concluido chega
+                                                     // true. 0 = nunca (ou Controle rebootou desde)
 static volatile bool ultimo_comando_falhou       = false;  // 2026-07-25 -- escrita em cb_envio()
                                                              // (task ESP-NOW), lida no loop/envio
                                                              // Supabase -- volatile, mesmo padrão
                                                              // de ultimo_pacote_bomba
+
+// 2026-08-06 -- rastreia o TIPO do envio pra Bomba em voo, pra cb_envio() só
+// atualizar ultimo_comando_falhou quando for comando de ação real (LIGA/
+// DESLIGA/SET_NIVEIS), não keep-alive (ping). Mesmo padrão volatile de
+// ultimo_comando_falhou -- escrito antes do esp_now_send(), lido em cb_envio().
+// Revisado em 2 rodadas pela Gemini: filtro por MAC_BOMBA (rodada 1) + filtro
+// por tipo de envio (rodada 2) -- ver histórico de decisão no conhecimento.
+enum TipoEnvioBomba : uint8_t { ENVIO_NENHUM, ENVIO_COMANDO, ENVIO_PING };
+static volatile TipoEnvioBomba envio_bomba_pendente = ENVIO_NENHUM;
+
+// 2026-08-06 -- movido de static local (dentro do bloco do ping em loop())
+// pra escopo de arquivo: enviar_comando()/enviar_config_niveis() precisam
+// resetar esse timer pra evitar corrida entre um comando real e o ping
+// disparando no mesmo ciclo (achado da revisão Gemini rodada 2).
+static uint32_t ultimo_ping_bomba = 0 - 600000UL + 5000UL;  // 1º ping ~5s após boot
 static bool         wifi_ultima_tentativa_falhou = false;  // 2026-07-25 -- setado em
                                                              // conectar_wifi_nao_bloqueante()
 static uint32_t     pzem_potencia_w      = 0;
@@ -269,6 +294,13 @@ static bool          webserver_ativo       = false;
 static volatile bool webserver_requisitado = false;  // flag para acionamento seguro fora do callback
 WebServer            servidor(80);
 
+// 2026-08-06 -- mesmo padrão de webserver_requisitado: bip() usa delay()
+// bloqueante, então nunca deve rodar direto dentro de cb_recepcao() (task
+// ESP-NOW) -- só enfileira aqui, execução real acontece no loop() (revisão
+// Gemini identificou o risco: bloquear a task do rádio por até 600ms podia
+// atrasar/derrubar pacotes concorrentes de Água/Bomba).
+static volatile uint8_t bip_pendente = 0;  // 0 = nada, N = apitos enfileirados
+
 // Parâmetros de configuração
 // IPs dos celulares monitorados p/ detecção de presença (loop_automatico_presenca).
 // Ajuste para os IPs reais dos dispositivos na sua rede (reserva de DHCP recomendada).
@@ -306,6 +338,7 @@ void salvar_params_ctrl();
 void salvar_params_net();
 void bip(uint8_t n);
 void ativar_buzzer_erro();
+static String epochParaISO8601(time_t epoch);  // 2026-08-06 -- forward pra uso no envio ao vivo
 void loop_buzzer_erro();
 void loop_buzzer_nivel();
 void loop_led_azul();
@@ -818,6 +851,10 @@ void loop_supabase() {
     }
     body += "\"wifi_falhou\":"       + String(wifi_ultima_tentativa_falhou ? "true" : "false") + ",";
     body += "\"comando_falhou\":"    + String(ultimo_comando_falhou ? "true" : "false")         + ",";
+    {
+        String isoAutoteste = epochParaISO8601(ultimo_autoteste_epoch);  // 2026-08-06
+        body += "\"ultimo_autoteste_at\":" + (isoAutoteste.length() ? "\"" + isoAutoteste + "\"" : "null") + ",";
+    }
     body += "\"wifi_rssi\":"         + String(WiFi.RSSI());
     body += "}";
 
@@ -875,7 +912,9 @@ void descarregar_buffer() {
         body += "\"bomba_causa_desligamento\":" + String(p.bomba_causa_desligamento) + ",";
         body += "\"ntp_sincronizado\":" + String(p.ntp_sincronizado ? "true" : "false") + ",";
         body += "\"wifi_falhou\":"      + String(p.wifi_falhou    ? "true" : "false") + ",";
-        body += "\"comando_falhou\":"   + String(p.comando_falhou ? "true" : "false");
+        body += "\"comando_falhou\":"   + String(p.comando_falhou ? "true" : "false") + ",";
+        String isoAutoteste = epochParaISO8601(p.ultimo_autoteste_epoch);  // 2026-08-06
+        body += "\"ultimo_autoteste_at\":" + (isoAutoteste.length() ? "\"" + isoAutoteste + "\"" : "null");
         body += "}";
     }
     body += "]";
@@ -1013,6 +1052,7 @@ void registrar_telemetria() {
     p.ntp_sincronizado = getLocalTime(&_info_ntp, 10);
     p.wifi_falhou    = wifi_ultima_tentativa_falhou;
     p.comando_falhou = ultimo_comando_falhou;
+    p.ultimo_autoteste_epoch = ultimo_autoteste_epoch;  // 2026-08-06
 
     telem_idx = (telem_idx + 1) % MAX_TELEMETRIA;
     if (telem_count < MAX_TELEMETRIA) telem_count++;
@@ -1022,11 +1062,31 @@ void registrar_telemetria() {
 // CALLBACKS ESP-NOW
 // -------------------------------------------------------------
 void cb_envio(const uint8_t* m, esp_now_send_status_t s) {
+    // 2026-08-06: cb_envio() é chamado pra QUALQUER esp_now_send() desta
+    // placa -- comandos/config/ping (Bomba) E status (Cardputer, a cada
+    // 10s). Dois filtros pra ultimo_comando_falhou refletir só falha de
+    // comando de ação real:
+    //   1) destino -- ignora Cardputer e qualquer coisa que não seja Bomba
+    //      (não mexe em envio_bomba_pendente nesse caso -- um callback do
+    //      Cardputer chegando fora de ordem não pode apagar o marcador de
+    //      um comando real da Bomba ainda pendente)
+    //   2) tipo em voo -- ignora ping/keep-alive, só conta ENVIO_COMANDO
+    // Risco residual conhecido (revisão Gemini, rodadas 1-2): corrida entre
+    // um comando real e o ping disparando no mesmo ciclo de loop() ainda é
+    // possível via loop_automatico_presenca() (roda DEPOIS do bloco do ping
+    // em loop(), diferente de loop_botoes()/rota web, que rodam antes) --
+    // janela de poucos ms, sem impacto em segurança, só no texto do aviso.
+    // Aceito como residual documentado, não perseguido além disso.
+    if (memcmp(m, MAC_BOMBA, 6) != 0) return;  // Cardputer/outro -- não mexe no marcador
+
+    TipoEnvioBomba tipo   = envio_bomba_pendente;
+    envio_bomba_pendente  = ENVIO_NENHUM;  // consome -- sucesso ou falha
+
     if (s != ESP_NOW_SEND_SUCCESS) {
-        Serial.println(F("[CONTROLE] Falha envio ESP-NOW."));
-        ultimo_comando_falhou = true;  // 2026-07-25 -- visível remotamente agora (marica-131)
+        Serial.println(F("[CONTROLE] Falha envio ESP-NOW (Bomba)."));
+        if (tipo == ENVIO_COMANDO) ultimo_comando_falhou = true;  // 2026-07-25 -- visível remotamente (marica-131)
     } else {
-        ultimo_comando_falhou = false;
+        if (tipo == ENVIO_COMANDO) ultimo_comando_falhou = false;
     }
 }
 
@@ -1058,6 +1118,11 @@ void cb_recepcao(const uint8_t* mac_addr, const uint8_t* dados, int len) {
         agua_motivo_status   = pkt.agua_motivo_status;    // 2026-07-25
         bomba_estado_bitmask = pkt.bomba_estado_bitmask;  // 2026-07-25
         bomba_causa_desligamento = pkt.bomba_causa_desligamento;  // 2026-07-25
+        if (pkt.autoteste_concluido) {  // 2026-08-06 -- Bomba não tem NTP, Controle carimba
+            ultimo_autoteste_epoch = time(nullptr);  // 0 se NTP não sincronizado -- mesmo
+                                                       // padrão de timestamp_epoch, tratado
+                                                       // no envio (epochParaISO8601)
+        }
         ultimo_pacote_bomba = millis();
 
         // Acumula potência durante sessão ativa para cálculo de média
@@ -1097,7 +1162,14 @@ void cb_recepcao(const uint8_t* mac_addr, const uint8_t* dados, int len) {
             ciclo_wifi_imediato = true;
         }
 
-        if (bomba_ligada != bomba_era) bip(1);
+        // 2026-08-06 -- Peter: 1 apito ao ligar (qualquer causa, EXCETO automático --
+        // o LED branco já indica celular na rede, apito seria redundante ali),
+        // 3 ao desligar (qualquer causa) -- incondicional, cobre "encheu e desligou"
+        // como um caso dentro da regra geral, sem precisar diferenciar por causa.
+        // Enfileira em vez de chamar bip() direto -- este trecho roda dentro do
+        // callback ESP-NOW (cb_recepcao), e bip() é bloqueante (delay()).
+        if (bomba_ligada && !bomba_era && origem_ultimo_comando_liga != ORIGEM_LIGA_AUTOMATICO) bip_pendente = 1;
+        if (!bomba_ligada && bomba_era) bip_pendente = 3;
 
         // Registro inteligente de nível — apenas quando variar > 1 cm
         // Evita lotar o ring buffer com leituras repetidas idênticas
@@ -1144,6 +1216,9 @@ void enviar_comando(uint8_t tipo_cmd, bool ignorar_nivel) {
     cmd.tipo              = tipo_cmd;
     cmd.horario_permitido = horario_bomba_permitido();
     cmd.ignorar_nivel     = ignorar_nivel;
+    envio_bomba_pendente  = ENVIO_COMANDO;  // 2026-08-06
+    ultimo_ping_bomba     = millis();  // 2026-08-06 -- comando real já prova presença;
+                                        // adia o próximo keep-alive, evita corrida com o ping
     esp_now_send(MAC_BOMBA, (uint8_t*)&cmd, sizeof(cmd));
 }
 
@@ -1160,6 +1235,8 @@ void enviar_config_niveis(uint8_t liga, uint8_t desliga, uint8_t seguranca, uint
     pkt.nivel_seguranca_cm  = seguranca;
     pkt.nivel_manual_min_cm = manual_min;
     pkt.timeout_minutos     = timeout_min;
+    envio_bomba_pendente    = ENVIO_COMANDO;  // 2026-08-06
+    ultimo_ping_bomba       = millis();       // 2026-08-06 -- mesma lógica de enviar_comando()
     esp_now_send(MAC_BOMBA, (uint8_t*)&pkt, sizeof(pkt));
     registrar_log("[ESP-NOW] TX Config → Liga:" + String(liga) +
                   "cm Desliga:" + String(desliga) +
@@ -1517,14 +1594,20 @@ void rota_set_niveis() {
 
     // Validação: liga > desliga, segurança > liga, timeout > 0, manual > 0
     // (ordem completa esperada pela Bomba, marica-032: seguranca > liga > manual_min)
+    // + segurança > SINALEIRA_AMARELO_MAX_CM (2026-08-07, marica-227 -- mesma regra
+    // que a Bomba aplica como autoridade final em CMD_SET_NIVEIS; validar aqui também
+    // dá feedback imediato ao usuário em vez de só rejeição silenciosa na Bomba)
     if (nova_liga <= novo_desliga || nova_seguranca <= nova_liga || novo_timeout == 0 ||
-        novo_manual == 0 || novo_manual >= nova_liga) {
+        novo_manual == 0 || novo_manual >= nova_liga ||
+        (float)nova_seguranca <= SINALEIRA_AMARELO_MAX_CM) {
         String html = F("<!DOCTYPE html><html><head><meta charset='utf-8'>");
         html += F("<meta http-equiv='refresh' content='4;url=/config'>");
         html += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
         html += F("<style>body{background:#0f1117;color:#e53e3e;font-family:monospace;text-align:center;padding:50px;}</style>");
         html += F("</head><body><h2>&#9888; Parametros invalidos</h2>");
-        html += F("<p>Ligar deve ser maior que Desligar.<br>Seguranca deve ser maior que Ligar.<br>Ligar deve ser maior que o Nivel Minimo Manual.<br>Timeout e Nivel Minimo devem ser maiores que zero.</p>");
+        html += F("<p>Ligar deve ser maior que Desligar.<br>Seguranca deve ser maior que Ligar.<br>Seguranca deve ser maior que ");
+        html += String(SINALEIRA_AMARELO_MAX_CM, 0);
+        html += F("cm (limite da sinaleira).<br>Ligar deve ser maior que o Nivel Minimo Manual.<br>Timeout e Nivel Minimo devem ser maiores que zero.</p>");
         html += F("<p>Voltando em 4s...</p></body></html>");
         servidor.send(200, "text/html", html);
         registrar_log(F("[WEB] SET_NIVEIS rejeitado: parametros invalidos."));
@@ -1699,8 +1782,10 @@ void loop_sinaleira() {
         return;
     }
 
-    // Sinaleira estática — geometria real do reservatório:
-    //   40 cm = cheio (100%) | 70 cm = vazio (0%)
+    // Sinaleira estática — 2026-08-07 (marica-226, decisão explícita de Peter):
+    // limites fixos independentes de cfg_desliga_cm/cfg_liga_cm (ver definição das
+    // macros acima pro porquê) -- a cor representa visualmente o nível da caixa,
+    // não mais o ponto exato em que a bomba liga/desliga.
     float n = nivel_atual;
     digitalWrite(GPIO_LED_VERDE,   LOW);
     digitalWrite(GPIO_LED_AMARELO, LOW);
@@ -1708,16 +1793,28 @@ void loop_sinaleira() {
 
     if (n <= 0.0f) return;  // sem leitura — todos apagados
 
-    if      (n <= 55.0f) { digitalWrite(GPIO_LED_VERDE,   HIGH); }  // cheio (sensor <= 55cm)
-    else if (n <= 65.0f) { digitalWrite(GPIO_LED_AMARELO, HIGH); }  // médio (55cm < sensor <= 65cm)
-    else                 { digitalWrite(GPIO_LED_VERM_S,  HIGH); }  // baixo / crítico (sensor > 65cm)
+    if (n > (float)cfg_nivel_seguranca) {
+        // Vermelho piscante -- além do limite de segurança, não é só "hora de
+        // encher", é alerta crítico (2026-08-06, Peter)
+        static uint32_t ultimo_pisca = 0; static bool aceso = false;
+        if (millis() - ultimo_pisca >= 500) { ultimo_pisca = millis(); aceso = !aceso; }
+        digitalWrite(GPIO_LED_VERM_S, aceso ? HIGH : LOW);
+    } else if (n <= SINALEIRA_VERDE_MAX_CM) {
+        digitalWrite(GPIO_LED_VERDE, HIGH);   // caixa "cheia" o suficiente pra ser verde
+    } else if (n <= SINALEIRA_AMARELO_MAX_CM) {
+        digitalWrite(GPIO_LED_AMARELO, HIGH); // faixa intermediária
+    } else {
+        digitalWrite(GPIO_LED_VERM_S, HIGH);  // caixa "baixa" o suficiente pra ser vermelha
+    }
 }
 
 // Buzzer de nível baixo — 3 bipes a cada 30 min quando sinaleira vermelha + semiautomático
 // Só dispara no horário permitido (09:00–22:00, verificado via buzzer_permitido())
 void loop_buzzer_nivel() {
-    // Condição: nível crítico (sensor > 65cm), modo semiautomático, horário permitido
-    bool nivel_critico = (nivel_atual > 65.0f && nivel_atual > 0.0f && !bomba_ligada);
+    // 2026-08-06 -- limiar alinhado com cfg_nivel_seguranca (era 65cm hardcoded,
+    // dessincronizado do que a sinaleira realmente usa pra piscar agora).
+    // "Crítico" aqui significa literalmente "mesmo ponto em que a sinaleira pisca".
+    bool nivel_critico = (nivel_atual > (float)cfg_nivel_seguranca && nivel_atual > 0.0f && !bomba_ligada);
     if (!nivel_critico || modo_atual != MODO_SEMIAUTOMATICO || !buzzer_permitido()) return;
 
     static uint32_t ultimo_aviso = 0;
@@ -1725,8 +1822,10 @@ void loop_buzzer_nivel() {
 
     if (millis() - ultimo_aviso >= INTERVALO_AVISO_MS) {
         ultimo_aviso = millis();
-        bip(3);
-        registrar_log(F("[SYS] Aviso sonoro: nivel critico em modo semiautomatico."));
+        // 2026-08-06 -- Peter: sem bip aqui, já coberto pela sinaleira vermelha
+        // piscante (>85cm). Log mantido pro histórico, texto ajustado (não é
+        // mais "sonoro").
+        registrar_log(F("[SYS] Aviso: nivel critico em modo semiautomatico (sinaleira piscando)."));
     }
 }
 
@@ -1874,7 +1973,9 @@ void setup() {
     iniciar_espnow();
     ultimo_ciclo_wifi = 0;  // flag: primeiro ciclo usa BOOT_DELAY_WIFI_MS
 
-    bip(2);
+    bip(3);  // 2026-08-06 -- era bip(2); Peter confirmou 3 apitos no boot, sem
+             // risco de confusão com outros usos de bip(3) (contexto isolado,
+             // acontece antes de qualquer evento de bomba/webserver em tempo real)
 
     Serial.println(F("=========================================="));
     Serial.println(F(" CAIXA CONTROLE - PRODUCAO MARICA"));
@@ -1917,6 +2018,14 @@ void loop() {
         abrir_webserver();
     }
 
+    // 2026-08-06 -- bip() enfileirado em cb_recepcao(), executado aqui (fora da
+    // task ESP-NOW) -- ver declaração de bip_pendente
+    if (bip_pendente) {
+        uint8_t n = bip_pendente;
+        bip_pendente = 0;
+        bip(n);
+    }
+
     // Servidor web ativo
     if (webserver_ativo) {
         servidor.handleClient();
@@ -1943,12 +2052,12 @@ void loop() {
     // Primeiro disparo aos 5s de uptime — evita race condition de boot com a Bomba
     // que assume modo automático após 8 min sem sinal da Controle
     {
-        static uint32_t ultimo_ping_bomba = millis() - 600000UL + 5000UL;
         if (espnow_ok && millis() - ultimo_ping_bomba >= 600000UL) {
             ultimo_ping_bomba = millis();
             PacketComandoBomba ping = {};
             ping.tipo              = CMD_PING_CONTROLE;
             ping.horario_permitido = horario_bomba_permitido();
+            envio_bomba_pendente   = ENVIO_PING;  // 2026-08-06
             esp_now_send(MAC_BOMBA, (uint8_t*)&ping, sizeof(ping));
             Serial.printf("[%s] [CONTROLE] Ping de presenca enviado. Horario:%s\n",
                           obter_hora().c_str(),
