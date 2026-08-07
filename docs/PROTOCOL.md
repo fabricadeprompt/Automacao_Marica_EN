@@ -40,6 +40,7 @@ the Water box with its own data before pushing it up to Supabase.
 | `agua_motivo_status` | Reason behind the Water box's current sensor status: normal reading, actively compensating for condensation (`modo_reflexao`, within its 20-minute window), no physical echo, condensation timeout exceeded, or unstable readings while the pump is running. Purely informational for the dashboard — never read by any safety decision |
 | `bomba_estado_bitmask` | **Informational** states only (quarantine, lockout, forced mode, stuck relay) — never used for safety decisions |
 | `bomba_causa_desligamento` | Reason for the last shutdown (manual, tank full, timeout, overflow, etc.) |
+| `autoteste_concluido` | `true` only on the single packet sent right after the relay self-test finishes (any result, whether or not the stuck-relay state changed) — lets the Control box timestamp, with its own NTP clock, the last time the check actually ran (the Pump box has no real-time clock of its own) |
 
 **Why two separate error/state bitmasks?** `bomba_erro_bitmask` is read by real safety
 decisions (interlocking and automatic shutdown); `bomba_estado_bitmask` is purely
